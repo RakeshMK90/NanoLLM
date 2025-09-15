@@ -168,6 +168,8 @@ class VLMService:
     def initialize_model(self):
         """Initialize the VLM model using ChatQuery plugin like video_query.py"""
         try:
+            logger.info(f"Initializing ChatQuery plugin with model: {self.model_name}")
+
             # Use ChatQuery plugin exactly like video_query.py
             self.llm = ChatQuery(
                 model=self.model_name,
@@ -180,14 +182,20 @@ class VLMService:
                 warmup=True
             )
 
+            logger.info("ChatQuery plugin created, adding text handler...")
+
             # Add text output handler
             self.llm.add(self.on_text)
+
+            logger.info("Starting ChatQuery plugin...")
             self.llm.start()
 
-            logger.info(f"Loaded VLM model with ChatQuery: {self.model_name}")
+            logger.info(f"Successfully loaded VLM model with ChatQuery: {self.model_name}")
             return True
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
 
     def on_text(self, text):
@@ -421,7 +429,7 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "model_loaded": vlm_service.model is not None,
+        "model_loaded": vlm_service.llm is not None,
         "video_active": vlm_service.is_running,
         "frames_processed": vlm_service.frame_count,
         "jetson_utils": JETSON_UTILS_AVAILABLE,
@@ -470,7 +478,7 @@ def get_observation_history():
 @app.route('/start', methods=['POST'])
 def start_processing():
     """Start video processing"""
-    if not vlm_service.model:
+    if not vlm_service.llm:
         return jsonify({"error": "Model not initialized"}), 500
 
     vlm_service.start_processing()
@@ -493,11 +501,25 @@ def get_config():
     """Get current configuration"""
     return jsonify({
         "model_name": vlm_service.model_name,
+        "model_loaded": vlm_service.llm is not None,
         "is_running": vlm_service.is_running,
         "queue_size": vlm_service.observation_queue.qsize(),
         "frames_processed": vlm_service.frame_count,
         "process_interval": vlm_service.process_every_n_frames,
         "jetson_utils_available": JETSON_UTILS_AVAILABLE,
+        "latest_response": vlm_service.latest_response,
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/debug', methods=['GET'])
+def debug_status():
+    """Debug endpoint to check model status"""
+    return jsonify({
+        "llm_plugin": str(type(vlm_service.llm)) if vlm_service.llm else None,
+        "llm_is_none": vlm_service.llm is None,
+        "latest_response": vlm_service.latest_response,
+        "model_name": vlm_service.model_name,
+        "processing_count": vlm_service.frame_count,
         "timestamp": datetime.now().isoformat()
     })
 
