@@ -1,0 +1,99 @@
+{
+  "vlm_container": {
+    "name": "live-llava",
+    "image": "docker.io/dustynv/nano_llm:r36.4.0",
+    "api_port": 8554,
+    "model": "Efficient-Large-Model/VILA1.5-3b",
+    "max_context_len": 256,
+    "max_new_tokens": 32,
+    "video_device": "/dev/video0",
+    "gpu_devices": ["nvidia.com/gpu=all"],
+    "volumes": [
+      "/home/rakesh/jetson-containers/data:/data",
+      "/run/user/1000/pulse:/run/user/1000/pulse"
+    ],
+    "devices": [
+      "/dev/bus/usb",
+      "/dev/video0"
+    ],
+    "environment": {
+      "HF_HOME": "/data/hf-cache",
+      "PULSE_SERVER": "unix:/run/user/1000/pulse/native",
+      "PYTHONPATH": "/opt/clip_trt:/opt/NanoLLM:/opt/NanoDB:/opt/faiss_lite",
+      "NVIDIA_VISIBLE_DEVICES": "all"
+    },
+    "startup_timeout": 30,
+    "health_check_interval": 5
+  },
+
+  "rag_container": {
+    "name": "rag-llm",
+    "image": "docker.io/dustynv/nano_llm:r36.4.0",
+    "api_port": 8555,
+    "model": "microsoft/DialoGPT-medium",
+    "quantization": "q4f16_ft",
+    "max_context_len": 2048,
+    "max_new_tokens": 256,
+    "gpu_devices": ["nvidia.com/gpu=all"],
+    "volumes": [
+      "/home/rakesh/jetson-containers/data:/data"
+    ],
+    "environment": {
+      "HF_HOME": "/data/hf-cache",
+      "PYTHONPATH": "/opt/NanoLLM:/opt/NanoDB:/opt/faiss_lite",
+      "NVIDIA_VISIBLE_DEVICES": "all"
+    },
+    "startup_timeout": 45,
+    "health_check_interval": 5
+  },
+
+  "orchestrator": {
+    "decision_threshold": 0.7,
+    "max_observations": 100,
+    "container_timeout": 30,
+    "cycle_interval": 10,
+    "api_port": 8080,
+    "log_level": "INFO",
+    "redis_url": "redis://agent-redis:6379/0",
+    "enable_monitoring": true,
+    "max_concurrent_containers": 1
+  },
+
+  "decision_rules": {
+    "high_priority_keywords": [
+      "warning", "error", "fault", "failure", "alarm", "critical"
+    ],
+    "connector_keywords": [
+      "connector", "pin", "cable", "port", "socket", "plug"
+    ],
+    "procedure_keywords": [
+      "procedure", "step", "install", "replace", "repair", "maintenance"
+    ],
+    "safety_keywords": [
+      "safety", "hazard", "danger", "caution", "risk"
+    ]
+  },
+
+  "monitoring": {
+    "prometheus_port": 9090,
+    "health_check_endpoints": [
+      "http://localhost:8554/health",
+      "http://localhost:8555/health",
+      "http://localhost:8556/health"
+    ],
+    "metrics_collection_interval": 30
+  },
+
+  "nanodb": {
+    "enabled": true,
+    "api_url": "http://nanodb:8556",
+    "timeout": 10
+  },
+
+  "faiss": {
+    "enabled": true,
+    "api_url": "http://faiss-service:8557",
+    "timeout": 15,
+    "embedding_dimension": 768
+  }
+}

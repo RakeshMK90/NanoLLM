@@ -1,0 +1,28 @@
+# Agent Orchestrator Requirements
+aiohttp>=3.8.0
+asyncio-throttle>=1.0.2
+pydantic>=1.10.0
+fastapi>=0.95.0
+uvicorn>=0.21.0
+flask>=2.3.0
+redis>=4.5.0
+websockets>=11.0
+requests>=2.31.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Logging and monitoring
+structlog>=23.1.0
+prometheus-client>=0.16.0
+
+# Container management
+podman-py>=4.5.0
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Async utilities
+asyncio-mqtt>=0.13.0

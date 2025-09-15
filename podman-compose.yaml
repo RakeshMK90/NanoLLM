@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # Agent Orchestrator - The Brain
+  agent-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: agent-orchestrator
+    restart: unless-stopped
+    networks:
+      - agent-network
+    volumes:
+      - agent-data:/data
+      - agent-logs:/logs
+      - /run/podman/podman.sock:/run/podman/podman.sock:rw
+      - ./agent_config.json:/app/agent_config.json:ro
+    environment:
+      - PYTHONPATH=/opt/NanoLLM:/opt/NanoDB:/opt/faiss_lite
+      - LOG_LEVEL=INFO
+      - AGENT_CONFIG=/app/agent_config.json
+      - PODMAN_SOCKET=/run/podman/podman.sock
+    ports:
+      - "8080:8080"  # Agent control API
+    command: >
+      python3 agent_orchestrator.py
+      --config /app/agent_config.json
+      --interval 10
+
+  # Redis for inter-service communication
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    networks:
+      - agent-network
+    volumes:
+      - agent-data:/data/redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --dir /data/redis
+
+networks:
+  agent-network:
+    driver: bridge
+
+volumes:
+  agent-data:
+    driver: local
+  agent-logs:
+    driver: local

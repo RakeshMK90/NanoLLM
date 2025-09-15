@@ -1,0 +1,192 @@
+version: '3.8'
+
+services:
+  # Shared data volume service
+  data-volume:
+    image: busybox
+    volumes:
+      - agent-data:/data
+      - agent-logs:/logs
+      - agent-cache:/cache
+    command: "true"
+
+  # Agent Orchestrator - The Brain
+  agent-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: agent-orchestrator
+    restart: unless-stopped
+    networks:
+      - agent-network
+    volumes:
+      - agent-data:/data
+      - agent-logs:/logs
+      - /var/run/podman/podman.sock:/var/run/podman/podman.sock:rw
+      - ./agent_config.json:/app/agent_config.json:ro
+    environment:
+      - PYTHONPATH=/opt/NanoLLM:/opt/NanoDB:/opt/faiss_lite
+      - LOG_LEVEL=INFO
+      - AGENT_CONFIG=/app/agent_config.json
+    ports:
+      - "8080:8080"  # Agent control API
+    depends_on:
+      - data-volume
+    command: >
+      python3 agent_orchestrator.py
+      --config /app/agent_config.json
+      --interval 10
+
+  # VLM Container (Live LLaVA)
+  vlm-service:
+    image: docker.io/dustynv/nano_llm:r36.4.0
+    container_name: live-llava
+    profiles:
+      - vlm-active  # Only start when VLM processing is needed
+    networks:
+      - agent-network
+    devices:
+      - nvidia.com/gpu=all
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev/video0:/dev/video0
+    volumes:
+      - agent-data:/data
+      - agent-cache:/cache/hf-cache
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      - ./vlm_service.py:/app/vlm_service.py:ro
+    environment:
+      - HF_HOME=/cache/hf-cache
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+      - PYTHONPATH=/opt/clip_trt:/opt/NanoLLM:/opt/NanoDB:/opt/faiss_lite
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "8554:8554"  # VLM API
+    shm_size: 8g
+    security_opt:
+      - label=disable
+    group_add:
+      - keep-groups
+    command: >
+      python3 /app/vlm_service.py
+      --model Efficient-Large-Model/VILA1.5-3b
+      --video-device /dev/video0
+      --host 0.0.0.0
+      --port 8554
+      --auto-start
+
+  # RAG + LLM Service
+  rag-llm-service:
+    image: docker.io/dustynv/nano_llm:r36.4.0
+    container_name: rag-llm
+    profiles:
+      - rag-active  # Only start when RAG processing is needed
+    networks:
+      - agent-network
+    devices:
+      - nvidia.com/gpu=all
+    volumes:
+      - agent-data:/data
+      - agent-cache:/cache/hf-cache
+      - ./rag_llm_service.py:/app/rag_llm_service.py:ro
+      - ./knowledge_base:/data/knowledge_base:ro
+    environment:
+      - HF_HOME=/cache/hf-cache
+      - PYTHONPATH=/opt/NanoLLM:/opt/NanoDB:/opt/faiss_lite
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "8555:8555"  # RAG API
+    shm_size: 8g
+    security_opt:
+      - label=disable
+    group_add:
+      - keep-groups
+    command: >
+      python3 /app/rag_llm_service.py
+      --model microsoft/DialoGPT-medium
+      --kb-path /data/knowledge_base
+      --host 0.0.0.0
+      --port 8555
+
+  # NanoDB Service (Diagram Database)
+  nanodb-service:
+    image: docker.io/dustynv/nanodb:latest
+    container_name: nanodb
+    networks:
+      - agent-network
+    volumes:
+      - agent-data:/data
+      - ./diagrams:/data/diagrams:ro
+    environment:
+      - DB_PATH=/data/nanodb.db
+    ports:
+      - "8556:8556"  # NanoDB API
+    command: >
+      python3 -m nanodb.server
+      --db-path /data/nanodb.db
+      --diagrams-path /data/diagrams
+      --host 0.0.0.0
+      --port 8556
+
+  # FAISS Vector Store Service
+  faiss-service:
+    image: python:3.10-slim
+    container_name: faiss-vectorstore
+    networks:
+      - agent-network
+    volumes:
+      - agent-data:/data
+      - ./faiss_requirements.txt:/app/requirements.txt:ro
+    environment:
+      - FAISS_INDEX_PATH=/data/faiss_index
+    ports:
+      - "8557:8557"  # FAISS API
+    command: >
+      sh -c "pip install -r /app/requirements.txt &&
+             python3 -m faiss_lite.server
+             --index-path /data/faiss_index
+             --host 0.0.0.0
+             --port 8557"
+
+  # Redis for inter-service communication and caching
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    networks:
+      - agent-network
+    volumes:
+      - agent-data:/data
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --dir /data
+
+  # Monitoring and Health Check Service
+  monitor:
+    image: prom/prometheus:latest
+    container_name: agent-monitor
+    networks:
+      - agent-network
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - agent-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+
+networks:
+  agent-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  agent-data:
+    driver: local
+  agent-logs:
+    driver: local
+  agent-cache:
+    driver: local
