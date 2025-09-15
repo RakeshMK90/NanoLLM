@@ -18,6 +18,7 @@ from PIL import Image
 
 # Import NanoLLM and jetson-utils components
 from nano_llm import NanoLLM, ChatHistory
+from nano_llm.plugins import ChatQuery
 from nano_llm.utils import ArgParser
 
 # Try to import jetson utils for video capture
@@ -47,8 +48,8 @@ class JetsonVideoCapture:
     def __init__(self, device="/dev/video0"):
         self.device = device
         self.camera = None
-        self.width = 640
-        self.height = 480
+        self.width = 1280  # Match video_query.py default resolution
+        self.height = 720
         self.initialize()
 
     def initialize(self):
@@ -155,31 +156,44 @@ class VLMService:
     def __init__(self, model_name: str = "Efficient-Large-Model/VILA1.5-3b"):
         self.model_name = model_name
         self.model = None
-        self.chat_history = None
+        self.llm = None  # ChatQuery plugin like video_query.py
         self.video_capture = None
         self.observation_queue = queue.Queue(maxsize=10)
         self.latest_observation = None
         self.is_running = False
         self.frame_count = 0
         self.process_every_n_frames = 90  # Process every 3 seconds at 30fps
+        self.latest_response = ""
 
     def initialize_model(self):
-        """Initialize the VLM model"""
+        """Initialize the VLM model using ChatQuery plugin like video_query.py"""
         try:
-            self.model = NanoLLM.from_pretrained(
-                self.model_name,
+            # Use ChatQuery plugin exactly like video_query.py
+            self.llm = ChatQuery(
+                model=self.model_name,
                 api='mlc',
                 quantization='q4f16_ft',
                 max_context_len=256,
-                vision_api='auto'
+                vision_api='auto',
+                drop_inputs=True,
+                vision_scaling='resize',
+                warmup=True
             )
-            # Initialize chat history for proper image handling
-            self.chat_history = ChatHistory(self.model)
-            logger.info(f"Loaded VLM model: {self.model_name}")
+
+            # Add text output handler
+            self.llm.add(self.on_text)
+            self.llm.start()
+
+            logger.info(f"Loaded VLM model with ChatQuery: {self.model_name}")
             return True
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             return False
+
+    def on_text(self, text):
+        """Handle text output from ChatQuery plugin"""
+        self.latest_response = text
+        logger.debug(f"Received text from model: {text[:50]}...")
 
     def initialize_video_source(self, device: str = "/dev/video0", use_fallback: bool = False):
         """Initialize video capture"""
@@ -259,16 +273,12 @@ class VLMService:
         )
 
     def process_frame(self, frame):
-        """Process a single video frame with VLM using proper ChatHistory approach"""
+        """Process frame using video_query.py pattern - the WORKING approach"""
         try:
             if frame is None:
                 return
 
-            # Ensure CUDA operations are synchronized before processing
-            if JETSON_UTILS_AVAILABLE:
-                jetson.utils.cudaDeviceSynchronize()
-
-            # Convert numpy array to proper format
+            # Convert numpy array to proper format (like video_query.py expects)
             if isinstance(frame, np.ndarray):
                 # Ensure frame is uint8 and in proper range
                 if frame.dtype != np.uint8:
@@ -285,6 +295,13 @@ class VLMService:
                     # Single channel to RGB
                     frame = np.repeat(frame, 3, axis=2)
 
+                # CRITICAL: Use exact video_query.py pattern - no PIL conversion!
+                np_image = frame  # Keep as numpy array
+
+                # Synchronize CUDA operations like video_query.py
+                if JETSON_UTILS_AVAILABLE:
+                    jetson.utils.cudaDeviceSynchronize()
+
             else:
                 logger.error(f"Unexpected frame type: {type(frame)}")
                 return
@@ -298,39 +315,17 @@ class VLMService:
             - Potential issues or anomalies
             Keep the description concise and technical."""
 
-            # Use ChatHistory approach to properly handle image input
-            # Reset chat history for each frame to avoid memory buildup
-            self.chat_history.reset()
+            # Reset response for new query
+            self.latest_response = ""
 
-            # Add image to chat history (this properly embeds the image)
-            self.chat_history.append('user', image=frame)
+            # Use EXACT video_query.py pattern - ChatQuery with numpy array
+            self.llm(['/reset', np_image, prompt])
 
-            # Add prompt as text
-            self.chat_history.append('user', text=prompt, use_cache=True)
+            # Wait a bit for response to generate
+            time.sleep(0.5)
 
-            # Get embeddings from chat history
-            embedding, _ = self.chat_history.embed_chat()
-
-            # Generate response using embeddings (not raw image)
-            response = self.model.generate(
-                embedding,
-                kv_cache=self.chat_history.kv_cache,
-                max_new_tokens=32,
-                temperature=0.1
-            )
-
-            # Get the response text
-            response_text = ""
-            if hasattr(response, 'text'):
-                response_text = response.text
-            elif hasattr(response, '__iter__'):
-                # If it's a generator, collect the tokens
-                response_text = ''.join(str(token) for token in response)
-            else:
-                response_text = str(response)
-
-            # Extract structured information
-            observation = self.extract_structured_info(response_text)
+            # Extract structured information from the response
+            observation = self.extract_structured_info(self.latest_response)
 
             # Update latest observation
             self.latest_observation = observation
@@ -362,12 +357,13 @@ class VLMService:
             self.latest_observation = error_observation
 
     def video_processing_loop(self):
-        """Main video processing loop"""
+        """Main video processing loop with sequential CUDA operations"""
         logger.info("Starting video processing loop")
 
         try:
             while self.is_running:
                 if self.video_capture:
+                    # Sequential approach: capture frame, then process completely before next capture
                     frame = self.video_capture.capture()
                     if frame is not None:
                         self.frame_count += 1
@@ -375,9 +371,23 @@ class VLMService:
                         # Process every Nth frame to avoid overwhelming the system
                         if self.frame_count % self.process_every_n_frames == 0:
                             logger.info(f"Processing frame {self.frame_count}")
+
+                            # CRITICAL: Ensure all CUDA operations from capture are complete
+                            if JETSON_UTILS_AVAILABLE:
+                                jetson.utils.cudaDeviceSynchronize()
+
+                            # Process frame completely before next capture
                             self.process_frame(frame)
 
-                time.sleep(0.033)  # ~30 FPS
+                            # Ensure VLM processing is complete before next iteration
+                            if JETSON_UTILS_AVAILABLE:
+                                jetson.utils.cudaDeviceSynchronize()
+
+                # Longer sleep when processing frames to give CUDA operations time to complete
+                if self.frame_count % self.process_every_n_frames == 0:
+                    time.sleep(0.1)  # 100ms after processing
+                else:
+                    time.sleep(0.033)  # ~30 FPS for non-processed frames
 
         except Exception as e:
             logger.error(f"Error in video processing loop: {e}")
