@@ -200,8 +200,24 @@ class VLMService:
 
     def on_text(self, text):
         """Handle text output from ChatQuery plugin"""
-        self.latest_response = text
-        logger.debug(f"Received text from model: {text[:50]}...")
+        # Accumulate text properly
+        if not hasattr(self, '_response_building'):
+            self._response_building = False
+
+        if not self._response_building:
+            # Start of new response
+            self.latest_response = text
+            self._response_building = True
+        else:
+            # Continue building response
+            self.latest_response += text
+
+        # Check if response is complete
+        if text.endswith(('</s>', '###')) or len(self.latest_response) > 200:
+            self._response_building = False
+            logger.info(f"Complete response: {self.latest_response}")
+
+        logger.debug(f"Text update: {text} | Total: {self.latest_response[:100]}...")
 
     def initialize_video_source(self, device: str = "/dev/video0", use_fallback: bool = False):
         """Initialize video capture"""
@@ -325,12 +341,19 @@ class VLMService:
 
             # Reset response for new query
             self.latest_response = ""
+            self._response_building = False
 
             # Use EXACT video_query.py pattern - ChatQuery with numpy array
             self.llm(['/reset', np_image, prompt])
 
-            # Wait a bit for response to generate
-            time.sleep(0.5)
+            # Wait for response to complete (with timeout)
+            max_wait = 5.0  # 5 seconds max
+            wait_time = 0.0
+            while wait_time < max_wait and (not self.latest_response or self._response_building):
+                time.sleep(0.1)
+                wait_time += 0.1
+
+            logger.info(f"Waited {wait_time:.1f}s for response: '{self.latest_response[:100]}...'")
 
             # Extract structured information from the response
             observation = self.extract_structured_info(self.latest_response)
