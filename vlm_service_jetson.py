@@ -17,7 +17,7 @@ import queue
 from PIL import Image
 
 # Import NanoLLM and jetson-utils components
-from nano_llm import NanoLLM
+from nano_llm import NanoLLM, ChatHistory
 from nano_llm.utils import ArgParser
 
 # Try to import jetson utils for video capture
@@ -143,6 +143,7 @@ class VLMService:
     def __init__(self, model_name: str = "Efficient-Large-Model/VILA1.5-3b"):
         self.model_name = model_name
         self.model = None
+        self.chat_history = None
         self.video_capture = None
         self.observation_queue = queue.Queue(maxsize=10)
         self.latest_observation = None
@@ -160,6 +161,8 @@ class VLMService:
                 max_context_len=256,
                 vision_api='auto'
             )
+            # Initialize chat history for proper image handling
+            self.chat_history = ChatHistory(self.model)
             logger.info(f"Loaded VLM model: {self.model_name}")
             return True
         except Exception as e:
@@ -236,17 +239,28 @@ class VLMService:
         )
 
     def process_frame(self, frame):
-        """Process a single video frame with VLM"""
+        """Process a single video frame with VLM using proper ChatHistory approach"""
         try:
             if frame is None:
                 return
 
-            # Convert numpy array to PIL Image
-            # jetson.utils frames are already in RGB format
+            # Convert numpy array to proper format
             if isinstance(frame, np.ndarray):
+                # Ensure frame is uint8 and in proper range
                 if frame.dtype != np.uint8:
-                    frame = (frame * 255).astype(np.uint8) if frame.max() <= 1.0 else frame.astype(np.uint8)
-                pil_image = Image.fromarray(frame)
+                    if frame.max() <= 1.0:
+                        frame = (frame * 255).astype(np.uint8)
+                    else:
+                        frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+                # Ensure proper shape (H, W, 3)
+                if len(frame.shape) == 2:
+                    # Grayscale to RGB
+                    frame = np.stack([frame, frame, frame], axis=2)
+                elif len(frame.shape) == 3 and frame.shape[2] == 1:
+                    # Single channel to RGB
+                    frame = np.repeat(frame, 3, axis=2)
+
             else:
                 logger.error(f"Unexpected frame type: {type(frame)}")
                 return
@@ -260,10 +274,23 @@ class VLMService:
             - Potential issues or anomalies
             Keep the description concise and technical."""
 
-            # Generate response from VLM
+            # Use ChatHistory approach to properly handle image input
+            # Reset chat history for each frame to avoid memory buildup
+            self.chat_history.reset()
+
+            # Add image to chat history (this properly embeds the image)
+            self.chat_history.append('user', image=frame)
+
+            # Add prompt as text
+            self.chat_history.append('user', text=prompt, use_cache=True)
+
+            # Get embeddings from chat history
+            embedding, _ = self.chat_history.embed_chat()
+
+            # Generate response using embeddings (not raw image)
             response = self.model.generate(
-                pil_image,
-                prompt=prompt,
+                embedding,
+                kv_cache=self.chat_history.kv_cache,
                 max_new_tokens=32,
                 temperature=0.1
             )
