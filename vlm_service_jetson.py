@@ -74,20 +74,27 @@ class JetsonVideoCapture:
                 # Capture from jetson.utils (returns CUDA memory)
                 cuda_img = self.camera.Capture()
                 if cuda_img is not None:
-                    # Use jetson.utils conversion to get RGB format directly
-                    # Convert to RGB8 format and then to numpy
-                    rgb_cuda = jetson.utils.cudaAllocMapped(width=cuda_img.width, height=cuda_img.height, format='rgb8')
-                    jetson.utils.cudaConvertColor(cuda_img, rgb_cuda)
-                    rgb_cpu = jetson.utils.cudaToNumpy(rgb_cuda)
-                    jetson.utils.cudaFree(rgb_cuda)
-                    return rgb_cpu
+                    # Convert directly to numpy - jetson.utils will handle the conversion
+                    rgb_cpu = jetson.utils.cudaToNumpy(cuda_img)
+
+                    # If it's I420 format (1D array), convert to grayscale for simplicity
+                    if len(rgb_cpu.shape) == 1:
+                        # Treat as grayscale and convert to RGB
+                        height, width = cuda_img.height, cuda_img.width
+                        y_plane = rgb_cpu[:height * width].reshape((height, width))
+                        # Convert grayscale to RGB by copying Y channel to all 3 channels
+                        rgb_img = np.stack([y_plane, y_plane, y_plane], axis=2)
+                        return rgb_img
+                    else:
+                        # Already in proper format
+                        return rgb_cpu
 
             return None
         except Exception as e:
             logger.error(f"Error capturing frame: {e}")
             # Fall back to mock frame on error
-            mock_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            mock_frame[100:300, 200:400] = [100, 150, 200]  # Add some content
+            mock_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            mock_frame[200:400, 400:600] = [100, 150, 200]  # Add some content
             return mock_frame
 
     def release(self):
