@@ -74,28 +74,40 @@ class JetsonVideoCapture:
                 # Capture from jetson.utils (returns CUDA memory)
                 cuda_img = self.camera.Capture()
                 if cuda_img is not None:
-                    # Convert directly to numpy - jetson.utils will handle the conversion
-                    rgb_cpu = jetson.utils.cudaToNumpy(cuda_img)
+                    # Synchronize CUDA operations to avoid stream conflicts
+                    jetson.utils.cudaDeviceSynchronize()
 
-                    # If it's I420 format (1D array), convert to grayscale for simplicity
-                    if len(rgb_cpu.shape) == 1:
-                        # Treat as grayscale and convert to RGB
-                        height, width = cuda_img.height, cuda_img.width
-                        y_plane = rgb_cpu[:height * width].reshape((height, width))
-                        # Convert grayscale to RGB by copying Y channel to all 3 channels
-                        rgb_img = np.stack([y_plane, y_plane, y_plane], axis=2)
-                        return rgb_img
-                    else:
-                        # Already in proper format
-                        return rgb_cpu
+                    # Convert CUDA image to numpy with proper error handling
+                    try:
+                        rgb_cpu = jetson.utils.cudaToNumpy(cuda_img)
+
+                        # Handle I420 format conversion
+                        if len(rgb_cpu.shape) == 1:
+                            # I420 format - extract Y plane for grayscale
+                            height, width = cuda_img.height, cuda_img.width
+                            y_plane = rgb_cpu[:height * width].reshape((height, width))
+                            # Convert grayscale to RGB
+                            rgb_img = np.stack([y_plane, y_plane, y_plane], axis=2)
+                            return rgb_img
+                        else:
+                            # Already in proper RGB format
+                            return rgb_cpu
+
+                    except Exception as conversion_error:
+                        logger.warning(f"CUDA conversion failed: {conversion_error}")
+                        # Fall back to simpler approach - just use mock data
+                        return self._get_mock_frame()
 
             return None
         except Exception as e:
             logger.error(f"Error capturing frame: {e}")
-            # Fall back to mock frame on error
-            mock_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            mock_frame[200:400, 400:600] = [100, 150, 200]  # Add some content
-            return mock_frame
+            return self._get_mock_frame()
+
+    def _get_mock_frame(self):
+        """Generate a mock frame for testing"""
+        mock_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        mock_frame[100:300, 200:400] = [100, 150, 200]  # Add some content
+        return mock_frame
 
     def release(self):
         """Release video capture"""
@@ -169,18 +181,26 @@ class VLMService:
             logger.error(f"Failed to load model: {e}")
             return False
 
-    def initialize_video_source(self, device: str = "/dev/video0"):
+    def initialize_video_source(self, device: str = "/dev/video0", use_fallback: bool = False):
         """Initialize video capture"""
         try:
-            if JETSON_UTILS_AVAILABLE:
-                self.video_capture = JetsonVideoCapture(device)
-            else:
+            # Use fallback for testing to avoid CUDA conflicts
+            if use_fallback or not JETSON_UTILS_AVAILABLE:
                 logger.warning("Using fallback video capture for testing")
                 self.video_capture = FallbackVideoCapture(device)
+            else:
+                self.video_capture = JetsonVideoCapture(device)
             return True
         except Exception as e:
             logger.error(f"Failed to initialize video source: {e}")
-            return False
+            # Try fallback if jetson capture fails
+            logger.info("Trying fallback video capture...")
+            try:
+                self.video_capture = FallbackVideoCapture(device)
+                return True
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {fallback_error}")
+                return False
 
     def extract_structured_info(self, raw_text: str) -> StructuredObservation:
         """Extract structured information from raw VLM output"""
@@ -243,6 +263,10 @@ class VLMService:
         try:
             if frame is None:
                 return
+
+            # Ensure CUDA operations are synchronized before processing
+            if JETSON_UTILS_AVAILABLE:
+                jetson.utils.cudaDeviceSynchronize()
 
             # Convert numpy array to proper format
             if isinstance(frame, np.ndarray):
@@ -477,6 +501,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8554, help="Port to bind to")
     parser.add_argument("--auto-start", action="store_true", help="Auto-start video processing")
+    parser.add_argument("--use-fallback", action="store_true", help="Use fallback video capture (for testing)")
 
     args = parser.parse_args()
 
@@ -489,7 +514,7 @@ def main():
         return 1
 
     logger.info("Initializing video source...")
-    if not vlm_service.initialize_video_source(args.video_device):
+    if not vlm_service.initialize_video_source(args.video_device, args.use_fallback):
         logger.error("Failed to initialize video source")
         return 1
 
