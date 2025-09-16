@@ -4,6 +4,7 @@ VLM Service - Jetson optimized version using existing jetson.utils
 Uses the existing video capture system from NanoLLM
 """
 
+import os
 import json
 import logging
 import time
@@ -178,13 +179,21 @@ class VLMService(Agent):
 
         # Video streams (like video_query.py)
         if JETSON_UTILS_AVAILABLE:
-            self.video_source = VideoSource(**kwargs, cuda_stream=0)
-            self.video_output = VideoOutput(**kwargs, cuda_stream=0)
+            # Extract video parameters from kwargs
+            video_input = kwargs.get('video_input', '/dev/video0')
+            video_output = kwargs.get('video_output', 'webrtc://@:8554/output')
+
+            self.video_source = VideoSource(video_input=video_input, cuda_stream=0)
+            self.video_output = VideoOutput(video_output=video_output, cuda_stream=0)
             self.font = cudaFont()
 
-            # Connect video processing
+            # Connect video processing chain (like video_query.py)
             self.video_source.add(self.on_video, threaded=False)
+            self.video_source.add(self.video_output)  # Direct connection for display
             self.video_output.start()
+
+            logger.info(f"Video source initialized: {video_input}")
+            logger.info(f"Video output initialized: {video_output}")
         else:
             self.video_source = None
             self.video_output = None
@@ -281,9 +290,8 @@ class VLMService(Agent):
         # Draw overlays on the video
         self.draw_overlays(image)
 
-        # Send to video output
-        if self.video_output:
-            self.video_output(image)
+        # Note: video output is handled automatically via direct connection
+        # self.video_source.add(self.video_output) in constructor
 
     def process_video_frame(self, image):
         """Process video frame for VLM analysis"""
@@ -466,6 +474,11 @@ class VLMService(Agent):
         try:
             # Setup keyboard handler
             self.setup_keyboard_handler()
+
+            # Start video source (this is critical for display output!)
+            if self.video_source:
+                logger.info("Starting video source...")
+                self.video_source.start()
 
             # Start web server for video streaming
             if hasattr(self, 'server'):
@@ -839,16 +852,24 @@ def main():
         logger.info("Setting up video output...")
         vlm_service.setup_webserver()
 
-    logger.info("Initializing video source...")
-    if not vlm_service.initialize_video_source(args.video_device, args.use_fallback):
-        logger.error("Failed to initialize video source")
-        return 1
+    # Initialize video source only if not using native video output
+    if not args.enable_video_output:
+        logger.info("Initializing video source...")
+        if not vlm_service.initialize_video_source(args.video_device, args.use_fallback):
+            logger.error("Failed to initialize video source")
+            return 1
+    else:
+        logger.info("Using native VideoSource/VideoOutput for display output")
 
     # Auto-start if requested
     if args.auto_start:
-        vlm_service.start_processing()
         if args.enable_video_output:
+            # Use native video processing with VideoSource/VideoOutput plugins
+            logger.info("Starting native video processing with display output...")
             vlm_service.start_video_processing()
+        else:
+            # Use fallback video processing for API-only mode
+            vlm_service.start_processing()
 
     # Start Flask server
     logger.info(f"Starting VLM service on {args.host}:{args.port}")
