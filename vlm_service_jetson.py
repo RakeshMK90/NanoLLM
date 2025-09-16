@@ -17,13 +17,15 @@ import queue
 from PIL import Image
 
 # Import NanoLLM and jetson-utils components
-from nano_llm import NanoLLM, ChatHistory
-from nano_llm.plugins import ChatQuery
-from nano_llm.utils import ArgParser
+from nano_llm import NanoLLM, ChatHistory, Agent
+from nano_llm.plugins import ChatQuery, VideoSource, VideoOutput, PrintStream
+from nano_llm.web import WebServer
+from nano_llm.utils import ArgParser, wrap_text
 
 # Try to import jetson utils for video capture
 try:
     import jetson.utils
+    from jetson_utils import cudaFont, cudaMemcpy, cudaToNumpy, cudaDeviceSynchronize, saveImage
     JETSON_UTILS_AVAILABLE = True
 except ImportError:
     JETSON_UTILS_AVAILABLE = False
@@ -150,20 +152,42 @@ class FallbackVideoCapture:
     def release(self):
         logger.info("Released fallback video capture")
 
-class VLMService:
-    """Vision-Language Model service with REST API"""
+class VLMService(Agent):
+    """Vision-Language Model service with REST API and video output"""
 
-    def __init__(self, model_name: str = "Efficient-Large-Model/VILA1.5-3b"):
+    def __init__(self, model_name: str = "Efficient-Large-Model/VILA1.5-3b", **kwargs):
+        super().__init__()
+
         self.model_name = model_name
         self.model = None
         self.llm = None  # ChatQuery plugin like video_query.py
-        self.video_capture = None
         self.observation_queue = queue.Queue(maxsize=10)
         self.latest_observation = None
         self.is_running = False
         self.frame_count = 0
         self.process_every_n_frames = 90  # Process every 3 seconds at 30fps
         self.latest_response = ""
+
+        # Video processing state
+        self.text = ""
+        self.eos = False
+        self.font = None
+        self.last_image = None
+        self.analyze_requested = False
+        self.rag_service_url = kwargs.get('rag_service_url', 'http://localhost:8555')
+
+        # Video streams (like video_query.py)
+        if JETSON_UTILS_AVAILABLE:
+            self.video_source = VideoSource(**kwargs, cuda_stream=0)
+            self.video_output = VideoOutput(**kwargs, cuda_stream=0)
+            self.font = cudaFont()
+
+            # Connect video processing
+            self.video_source.add(self.on_video, threaded=False)
+            self.video_output.start()
+        else:
+            self.video_source = None
+            self.video_output = None
 
     def initialize_model(self):
         """Initialize the VLM model using ChatQuery plugin like video_query.py"""
@@ -185,7 +209,7 @@ class VLMService:
             logger.info("ChatQuery plugin created, adding text handler...")
 
             # Add text output handler
-            self.llm.add(self.on_text)
+            self.llm.add(PrintStream(color='green', relay=True).add(self.on_text))
 
             logger.info("Starting ChatQuery plugin...")
             self.llm.start()
@@ -200,24 +224,257 @@ class VLMService:
 
     def on_text(self, text):
         """Handle text output from ChatQuery plugin"""
-        # Accumulate text properly
-        if not hasattr(self, '_response_building'):
-            self._response_building = False
+        # Handle streaming text like video_query.py
+        from nano_llm import StopTokens
 
-        if not self._response_building:
-            # Start of new response
-            self.latest_response = text
-            self._response_building = True
+        if self.eos:
+            self.text = text  # reset rolling text
+            self.eos = False  # new query response
         else:
-            # Continue building response
-            self.latest_response += text
+            self.text = self.text + text
 
-        # Check if response is complete
-        if text.endswith(('</s>', '###')) or len(self.latest_response) > 200:
-            self._response_building = False
-            logger.info(f"Complete response: {self.latest_response}")
+        if text.endswith(tuple(StopTokens + ['###', '</s>'])):
+            self.eos = True
+            # Process completed observation
+            self.process_completed_observation()
 
-        logger.debug(f"Text update: {text} | Total: {self.latest_response[:100]}...")
+        logger.debug(f"Text update: {text} | Current: {self.text[:100]}...")
+
+    def process_completed_observation(self):
+        """Process the completed VLM observation"""
+        try:
+            # Extract structured information
+            observation = self.extract_structured_info(self.text)
+
+            # Update latest observation
+            self.latest_observation = observation
+
+            # Add to queue (non-blocking)
+            try:
+                self.observation_queue.put_nowait(observation)
+            except queue.Full:
+                # Remove oldest observation if queue is full
+                try:
+                    self.observation_queue.get_nowait()
+                    self.observation_queue.put_nowait(observation)
+                except queue.Empty:
+                    pass
+
+            logger.info(f"Processed observation: {observation.content[:50]}...")
+
+        except Exception as e:
+            logger.error(f"Error processing observation: {e}")
+
+    def on_video(self, image):
+        """Process video frames with object overlay and RAG integration"""
+        if not JETSON_UTILS_AVAILABLE or not self.font:
+            return
+
+        # Store last image for RAG analysis
+        self.last_image = cudaMemcpy(image)
+
+        # Process frame for VLM analysis (every N frames)
+        self.frame_count += 1
+        if self.frame_count % self.process_every_n_frames == 0:
+            self.process_video_frame(image)
+
+        # Draw overlays on the video
+        self.draw_overlays(image)
+
+        # Send to video output
+        if self.video_output:
+            self.video_output(image)
+
+    def process_video_frame(self, image):
+        """Process video frame for VLM analysis"""
+        try:
+            np_image = cudaToNumpy(image)
+            cudaDeviceSynchronize()
+
+            prompt = """Analyze this image for technical elements. List any detected objects, people, equipment, or issues. Be concise."""
+
+            self.llm(['/reset', np_image, prompt])
+
+        except Exception as e:
+            logger.error(f"Error processing video frame: {e}")
+
+    def draw_overlays(self, image):
+        """Draw text overlays and object tags on video"""
+        if not self.font:
+            return
+
+        y = 5
+
+        # Draw latest VLM analysis
+        if self.text:
+            clean_text = self.text.replace('\n', '').replace('</s>', '').strip()
+            y = wrap_text(self.font, image, text=f"Analysis: {clean_text}",
+                         x=5, y=y, color=self.font.White, background=self.font.Gray40)
+
+        # Draw detected objects with tags
+        if self.latest_observation and self.latest_observation.detected_objects:
+            objects_text = "Objects: " + ", ".join(self.latest_observation.detected_objects)
+            y = wrap_text(self.font, image, text=objects_text,
+                         x=5, y=y, color=(120,215,21), background=self.font.Gray40)
+
+        # Draw analyze button prompt
+        y = wrap_text(self.font, image, text="Press 'A' for RAG Analysis",
+                     x=5, y=y, color=(255,172,28), background=self.font.Gray40)
+
+        # Draw frame counter
+        y = wrap_text(self.font, image, text=f"Frame: {self.frame_count}",
+                     x=5, y=y, color=(128,128,128), background=self.font.Gray40)
+
+    def setup_keyboard_handler(self):
+        """Setup keyboard handler for analyze button"""
+        def keyboard_thread():
+            while self.is_running:
+                try:
+                    key = input().strip().lower()
+                    if key == 'a' and self.latest_observation:
+                        self.trigger_rag_analysis()
+                except Exception as e:
+                    continue
+
+        thread = threading.Thread(target=keyboard_thread, daemon=True)
+        thread.start()
+
+    def trigger_rag_analysis(self):
+        """Trigger RAG analysis of current observation"""
+        if not self.latest_observation or not self.latest_observation.detected_objects:
+            logger.warning("No objects detected for RAG analysis")
+            return
+
+        try:
+            # Build query from detected objects and observation
+            objects = ", ".join(self.latest_observation.detected_objects)
+            query = f"Troubleshooting for {objects}: {self.latest_observation.content[:100]}"
+
+            logger.info(f"Triggering RAG analysis: {query}")
+
+            # Call RAG service
+            response = self.call_rag_service(query)
+
+            if response:
+                logger.info(f"RAG response: {response[:200]}...")
+                # You could save this to a file, display in UI, etc.
+                self.save_rag_response(query, response)
+
+        except Exception as e:
+            logger.error(f"Error in RAG analysis: {e}")
+
+    def call_rag_service(self, query: str) -> str:
+        """Call the RAG+LLM service"""
+        try:
+            import requests
+
+            url = f"{self.rag_service_url}/query"
+            data = {
+                "query": query,
+                "k": 3
+            }
+
+            response = requests.post(url, json=data, timeout=30)
+            response.raise_for_status()
+
+            result = response.json()
+            return result.get('response', '')
+
+        except Exception as e:
+            logger.error(f"Failed to call RAG service: {e}")
+            return ""
+
+    def save_rag_response(self, query: str, response: str):
+        """Save RAG response to file"""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"/data/rag_responses/response_{timestamp}.txt"
+
+            # Create directory if it doesn't exist
+            import os
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+            with open(filename, 'w') as f:
+                f.write(f"Query: {query}\n\n")
+                f.write(f"Response: {response}\n\n")
+                f.write(f"Timestamp: {timestamp}\n")
+
+            logger.info(f"Saved RAG response to {filename}")
+
+        except Exception as e:
+            logger.error(f"Failed to save RAG response: {e}")
+
+    def setup_webserver(self, **kwargs):
+        """Setup WebServer for video output"""
+        if not JETSON_UTILS_AVAILABLE:
+            return
+
+        try:
+            # Setup WebRTC video streaming
+            video_source = self.video_source.stream.GetOptions()['resource']
+            video_output = self.video_output.stream.GetOptions()['resource']
+
+            webrtc_args = {}
+
+            if video_source['protocol'] == 'webrtc':
+                webrtc_args.update(dict(webrtc_input_stream=video_source['path'].strip('/'),
+                                       webrtc_input_port=video_source['port'],
+                                       send_webrtc=True))
+            else:
+                webrtc_args.update(dict(webrtc_input_stream='input',
+                                       webrtc_input_port=8554,
+                                       send_webrtc=False))
+
+            if video_output['protocol'] == 'webrtc':
+                webrtc_args.update(dict(webrtc_output_stream=video_output['path'].strip('/'),
+                                       webrtc_output_port=video_output['port']))
+            else:
+                webrtc_args.update(dict(webrtc_output_stream='output',
+                                       webrtc_output_port=8554))
+
+            # Create web server for video streaming
+            self.server = WebServer(
+                msg_callback=self.on_websocket,
+                index='video_query.html',
+                title='VLM Technical Analysis',
+                model=os.path.basename(self.model_name),
+                **webrtc_args,
+                **kwargs
+            )
+
+            logger.info("WebServer setup for video streaming")
+
+        except Exception as e:
+            logger.error(f"Failed to setup WebServer: {e}")
+
+    def on_websocket(self, msg, msg_type=0, metadata='', **kwargs):
+        """Handle WebSocket messages"""
+        if msg_type == WebServer.MESSAGE_JSON:
+            if 'analyze' in msg:
+                # Trigger RAG analysis via websocket
+                self.trigger_rag_analysis()
+            elif 'rag_service_url' in msg:
+                self.rag_service_url = msg['rag_service_url']
+                logger.info(f"Updated RAG service URL: {self.rag_service_url}")
+
+    def start_video_processing(self):
+        """Start video processing and web server"""
+        if not JETSON_UTILS_AVAILABLE:
+            logger.warning("Video processing not available without jetson.utils")
+            return
+
+        try:
+            # Setup keyboard handler
+            self.setup_keyboard_handler()
+
+            # Start web server for video streaming
+            if hasattr(self, 'server'):
+                self.server.start()
+
+            logger.info("Video processing started with web interface")
+
+        except Exception as e:
+            logger.error(f"Failed to start video processing: {e}")
 
     def initialize_video_source(self, device: str = "/dev/video0", use_fallback: bool = False):
         """Initialize video capture"""
@@ -557,16 +814,30 @@ def main():
     parser.add_argument("--port", type=int, default=8554, help="Port to bind to")
     parser.add_argument("--auto-start", action="store_true", help="Auto-start video processing")
     parser.add_argument("--use-fallback", action="store_true", help="Use fallback video capture (for testing)")
+    parser.add_argument("--enable-video-output", action="store_true", help="Enable video output with overlays")
+    parser.add_argument("--rag-service-url", default="http://localhost:8555", help="RAG service URL")
+    parser.add_argument("--video-input", default="/dev/video0", help="Video input device")
+    parser.add_argument("--video-output", default="webrtc://@:8554/output", help="Video output stream")
 
     args = parser.parse_args()
 
-    # Initialize VLM service
-    vlm_service.model_name = args.model
+    # Initialize VLM service with video options
+    vlm_service = VLMService(
+        model_name=args.model,
+        rag_service_url=args.rag_service_url,
+        video_input=args.video_input,
+        video_output=args.video_output
+    )
 
     logger.info("Initializing VLM model...")
     if not vlm_service.initialize_model():
         logger.error("Failed to initialize model")
         return 1
+
+    # Setup video output if enabled
+    if args.enable_video_output:
+        logger.info("Setting up video output...")
+        vlm_service.setup_webserver()
 
     logger.info("Initializing video source...")
     if not vlm_service.initialize_video_source(args.video_device, args.use_fallback):
@@ -576,6 +847,8 @@ def main():
     # Auto-start if requested
     if args.auto_start:
         vlm_service.start_processing()
+        if args.enable_video_output:
+            vlm_service.start_video_processing()
 
     # Start Flask server
     logger.info(f"Starting VLM service on {args.host}:{args.port}")
