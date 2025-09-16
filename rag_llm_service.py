@@ -192,8 +192,9 @@ class NanoDBConnector:
 class RAGLLMService:
     """RAG + LLM service combining retrieval with language generation"""
 
-    def __init__(self, llm_model: str = "microsoft/DialoGPT-medium"):
+    def __init__(self, llm_model: str = "microsoft/DialoGPT-medium", api: str = "mlc"):
         self.llm_model_name = llm_model
+        self.api = api
         self.llm = None
         self.chat_history = None
         self.retriever = FAISSRetriever()
@@ -203,12 +204,22 @@ class RAGLLMService:
     def initialize_llm(self):
         """Initialize the quantized LLM"""
         try:
-            self.llm = NanoLLM.from_pretrained(
-                self.llm_model_name,
-                api='mlc',
-                quantization='q4f16_ft',
-                max_context_len=2048
-            )
+            # Use the API specified in constructor
+            if self.api == 'hf':
+                self.llm = NanoLLM.from_pretrained(
+                    self.llm_model_name,
+                    api='hf',
+                    max_context_len=2048
+                )
+            else:
+                # Default to MLC
+                self.llm = NanoLLM.from_pretrained(
+                    self.llm_model_name,
+                    api='mlc',
+                    quantization='q4f16_ft',
+                    max_context_len=2048,
+                    vision_api='auto'
+                )
 
             self.chat_history = ChatHistory(self.llm)
             logger.info(f"Loaded LLM model: {self.llm_model_name}")
@@ -454,6 +465,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="RAG + LLM Service")
     parser.add_argument("--model", default="microsoft/DialoGPT-medium", help="LLM model name")
+    parser.add_argument("--api", default="mlc", choices=["mlc", "hf"], help="LLM API to use")
     parser.add_argument("--kb-path", default="/data/knowledge_base", help="Knowledge base path")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8555, help="Port to bind to")
@@ -462,6 +474,7 @@ def main():
 
     # Initialize RAG service
     rag_service.llm_model_name = args.model
+    rag_service.api = args.api
 
     logger.info("Initializing LLM...")
     if not rag_service.initialize_llm():
