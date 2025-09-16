@@ -71,7 +71,7 @@ class FAISSRetriever:
 
             if self.index and faiss:
                 # Normalize embedding for cosine similarity
-                embedding = doc.embedding.reshape(1, -1)
+                embedding = doc.embedding.reshape(1, -1).astype(np.float32)
                 faiss.normalize_L2(embedding)
                 self.index.add(embedding)
 
@@ -84,7 +84,7 @@ class FAISSRetriever:
 
         if self.index and faiss:
             # Normalize query embedding
-            query_embedding = query_embedding.reshape(1, -1)
+            query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
             faiss.normalize_L2(query_embedding)
 
             # Search
