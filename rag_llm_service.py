@@ -337,13 +337,26 @@ Response:"""
                 do_sample=True
             )
 
+            # Handle different response formats
+            response_text = ""
+            if hasattr(response, 'text'):
+                response_text = response.text
+            elif hasattr(response, '__iter__'):
+                # If it's a generator, collect all tokens
+                response_text = ''.join(str(token) for token in response)
+            else:
+                response_text = str(response)
+
+            # Clean up the response
+            response_text = response_text.strip()
+
             # Calculate confidence based on document relevance
             confidence = 0.8 if retrieved_docs else 0.3
 
             result = RetrievalResult(
                 query=query,
                 retrieved_docs=retrieved_docs,
-                llm_response=response.text if hasattr(response, 'text') else str(response),
+                llm_response=response_text,
                 confidence=confidence,
                 timestamp=datetime.now().isoformat()
             )
@@ -429,8 +442,18 @@ def chat():
             temperature=temperature
         )
 
+        # Handle different response formats
+        response_text = ""
+        if hasattr(response, 'text'):
+            response_text = response.text
+        elif hasattr(response, '__iter__'):
+            # If it's a generator, collect all tokens
+            response_text = ''.join(str(token) for token in response)
+        else:
+            response_text = str(response)
+
         return jsonify({
-            "response": response.text if hasattr(response, 'text') else str(response),
+            "response": response_text.strip(),
             "timestamp": datetime.now().isoformat()
         })
 
