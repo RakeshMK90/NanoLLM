@@ -518,8 +518,7 @@ class VLMService(Agent):
         # Extract detected objects (simple keyword matching)
         detected_objects = []
         object_keywords = [
-            "person", "man", "woman", "face", "hand", "phone", "mug", "cup",
-            "connector", "cable", "wire", "button", "switch", "panel", "display",
+            "phone", "mug", "cup", "wire","connector", "cable", "wire", "button", "switch", "panel", "display",
             "warning", "light", "indicator", "gauge", "meter", "sensor",
             "screw", "bolt", "nut", "cover", "housing", "bracket"
         ]
