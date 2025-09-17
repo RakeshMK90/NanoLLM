@@ -601,7 +601,6 @@ class VLMService(Agent):
 
             # Prepare prompt for technical analysis
             prompt = """Analyze this image for technical elements. Describe what you see including:
-            - Any people, faces, or human activity
             - Technical equipment, connectors, cables, or electrical components
             - Warning lights, indicators, or displays
             - Any visible text, labels, or numbers
