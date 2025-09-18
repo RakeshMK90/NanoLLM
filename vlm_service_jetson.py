@@ -299,7 +299,7 @@ class VLMService(Agent):
             np_image = cudaToNumpy(image)
             cudaDeviceSynchronize()
 
-            prompt = """Analyze this image for technical elements. List any detected objects, people, equipment, or issues. Be concise."""
+            prompt = """Analyze this image for technical elements. List any detected objects, equipment, or issues. Be concise."""
 
             self.llm(['/reset', np_image, prompt])
 
@@ -379,7 +379,7 @@ class VLMService(Agent):
             url = f"{self.rag_service_url}/query"
             data = {
                 "query": query,
-                "k": 3
+                "k": 1
             }
 
             response = requests.post(url, json=data, timeout=30)
