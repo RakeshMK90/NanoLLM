@@ -27,7 +27,7 @@ class ObjectDetection(Agent):
     """
     
     def __init__(self, model="liuhaotian/llava-v1.5-13b", nanodb=None, vision_scaling='resize', 
-                 target_objects=None, detection_threshold=0.5, **kwargs):
+                 target_objects=None, detection_threshold=0.7, stability_threshold=0.6, **kwargs):
         """
         Args:
             model (NanoLLM|str): the NanoLLM multimodal model instance, or name/path of a multimodal model to load.
@@ -51,6 +51,11 @@ class ObjectDetection(Agent):
         self.detection_threshold = detection_threshold
         self.detected_objects = []  # Current frame detected objects
         self.object_colors = self._generate_object_colors()
+        
+        # Detection stability tracking
+        self.detection_history = []  # Keep track of recent detections
+        self.max_history = 5  # Keep last 5 frames of detection history
+        self.stability_threshold = stability_threshold  # Require consistency for stable detection
         
         #: The model plugin (ChatQuery)
         self.llm = ChatQuery(model=model, drop_inputs=True, vision_scaling=vision_scaling, warmup=True, **kwargs)
@@ -81,7 +86,7 @@ class ObjectDetection(Agent):
         
         if not self.prompt_history:
             self.prompt_history = [
-                f'Identify and locate all objects in this image. Look for: {", ".join(self.target_objects)}. For each detected object, provide the object name and approximate location (top-left, top-right, bottom-left, bottom-right, center).'
+                f'Look carefully at this image and identify ONLY the objects that are actually visible and present. Look specifically for: {", ".join(self.target_objects)}. For each object you can clearly see, state "I can see [object name] at [location]" or "There is a [object name] at [location]". If you cannot see any of these objects, say "No target objects visible". Be precise - only mention objects that are actually present in the image.'
             ]
         
         self.prompt = self.prompt_history[0]
@@ -185,16 +190,63 @@ class ObjectDetection(Agent):
 
     def parse_object_detections(self, text: str) -> List[Dict]:
         """
-        Parse object detection results from model text output.
-        Expected format: "person at center", "car at top-left", etc.
+        Parse object detection results from model text output with improved filtering.
+        Only detects objects when explicitly mentioned with location or confidence indicators.
         """
         detections = []
         text_lower = text.lower()
         
+        # Look for explicit detection patterns
+        detection_patterns = [
+            f"{obj} at",
+            f"{obj} in",
+            f"{obj} on",
+            f"{obj} visible",
+            f"{obj} present",
+            f"see {obj}",
+            f"detect {obj}",
+            f"find {obj}",
+            f"there is {obj}",
+            f"there are {obj}",
+            f"i can see {obj}",
+            f"i see {obj}",
+            f"visible {obj}",
+            f"present {obj}"
+        ]
+        
         for obj in self.target_objects:
-            if obj.lower() in text_lower:
+            obj_lower = obj.lower()
+            
+            # Check if object is mentioned with detection context
+            is_detected = False
+            position = "center"  # default
+            
+            for pattern in detection_patterns:
+                if pattern.replace("{}", obj_lower) in text_lower:
+                    is_detected = True
+                    break
+            
+            # Additional filtering - avoid false positives
+            if is_detected:
+                # Check for negative indicators
+                negative_indicators = [
+                    f"no {obj_lower}",
+                    f"not {obj_lower}",
+                    f"cannot see {obj_lower}",
+                    f"don't see {obj_lower}",
+                    f"no visible {obj_lower}",
+                    f"not visible {obj_lower}",
+                    f"not present {obj_lower}",
+                    f"no {obj_lower} visible",
+                    f"no {obj_lower} present"
+                ]
+                
+                # If negative indicators are present, don't detect
+                has_negative = any(neg in text_lower for neg in negative_indicators)
+                if has_negative:
+                    continue
+                
                 # Try to extract position information
-                position = "center"  # default
                 if "top-left" in text_lower:
                     position = "top-left"
                 elif "top-right" in text_lower:
@@ -206,17 +258,95 @@ class ObjectDetection(Agent):
                 elif "center" in text_lower:
                     position = "center"
                 
-                # Calculate bounding box based on position
-                bbox = self._position_to_bbox(position)
+                # Calculate confidence based on text context
+                confidence = self._calculate_confidence(text_lower, obj_lower)
                 
-                detections.append({
-                    'object': obj,
-                    'position': position,
-                    'bbox': bbox,
-                    'confidence': self.detection_threshold  # Default confidence
-                })
+                # Only add if confidence is above threshold
+                if confidence >= self.detection_threshold:
+                    bbox = self._position_to_bbox(position)
+                    detections.append({
+                        'object': obj,
+                        'position': position,
+                        'bbox': bbox,
+                        'confidence': confidence
+                    })
         
         return detections
+
+    def _calculate_confidence(self, text: str, obj: str) -> float:
+        """Calculate confidence score based on text context."""
+        confidence = 0.0
+        
+        # High confidence indicators
+        high_confidence_phrases = [
+            f"clearly see {obj}",
+            f"definitely {obj}",
+            f"obvious {obj}",
+            f"prominent {obj}",
+            f"main {obj}",
+            f"large {obj}",
+            f"visible {obj}",
+            f"present {obj}"
+        ]
+        
+        # Medium confidence indicators
+        medium_confidence_phrases = [
+            f"see {obj}",
+            f"detect {obj}",
+            f"find {obj}",
+            f"there is {obj}",
+            f"there are {obj}",
+            f"i can see {obj}",
+            f"i see {obj}"
+        ]
+        
+        # Check for high confidence phrases
+        for phrase in high_confidence_phrases:
+            if phrase in text:
+                confidence = max(confidence, 0.8)
+        
+        # Check for medium confidence phrases
+        for phrase in medium_confidence_phrases:
+            if phrase in text:
+                confidence = max(confidence, 0.6)
+        
+        # Default confidence if object is mentioned but no specific context
+        if obj in text and confidence == 0.0:
+            confidence = 0.4
+        
+        return confidence
+
+    def _filter_stable_detections(self, detections: List[Dict]) -> List[Dict]:
+        """Filter detections based on stability across recent frames."""
+        if not detections:
+            return detections
+        
+        # Add current detections to history
+        current_objects = set(d['object'] for d in detections)
+        self.detection_history.append(current_objects)
+        
+        # Keep only recent history
+        if len(self.detection_history) > self.max_history:
+            self.detection_history.pop(0)
+        
+        # If we don't have enough history, return all detections
+        if len(self.detection_history) < 3:
+            return detections
+        
+        # Filter detections based on stability
+        stable_detections = []
+        for detection in detections:
+            obj = detection['object']
+            
+            # Count how many times this object was detected in recent history
+            detection_count = sum(1 for frame_objects in self.detection_history if obj in frame_objects)
+            stability_ratio = detection_count / len(self.detection_history)
+            
+            # Only keep if stable enough
+            if stability_ratio >= self.stability_threshold:
+                stable_detections.append(detection)
+        
+        return stable_detections
 
     def _position_to_bbox(self, position: str) -> Tuple[int, int, int, int]:
         """Convert position string to bounding box coordinates (x1, y1, x2, y2)."""
@@ -307,7 +437,10 @@ class ObjectDetection(Agent):
 
         if text.endswith(tuple(StopTokens + ['###'])):
             # Parse object detections from the complete text
-            self.detected_objects = self.parse_object_detections(self.text)
+            raw_detections = self.parse_object_detections(self.text)
+            
+            # Apply stability filtering to reduce false positives
+            self.detected_objects = self._filter_stable_detections(raw_detections)
             
             self.print_stats()
 
@@ -459,7 +592,9 @@ if __name__ == "__main__":
     parser = ArgParser(extras=ArgParser.Defaults+['video_input', 'video_output', 'web', 'nanodb'])
     parser.add_argument("--target-objects", nargs='+', default=['car', 'bicycle', 'dog', 'cat'], 
                        help="List of objects to detect and highlight")
-    parser.add_argument("--detection-threshold", type=float, default=0.5, 
-                       help="Confidence threshold for object detection (0.0 to 1.0)")
+    parser.add_argument("--detection-threshold", type=float, default=0.7, 
+                       help="Confidence threshold for object detection (0.0 to 1.0, higher = more conservative)")
+    parser.add_argument("--stability-threshold", type=float, default=0.6,
+                       help="Stability threshold for filtering false positives (0.0 to 1.0, higher = more stable)")
     args = parser.parse_args()
     agent = ObjectDetection(**vars(args)).run()
