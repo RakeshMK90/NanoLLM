@@ -166,7 +166,7 @@ class VLMService(Agent):
         self.latest_observation = None
         self.is_running = False
         self.frame_count = 0
-        self.process_every_n_frames = 90  # Process every 3 seconds at 30fps
+        self.process_every_n_frames = 60  # Process every 2 seconds at 30fps (more responsive)
         self.latest_response = ""
 
         # Video processing state
@@ -176,6 +176,10 @@ class VLMService(Agent):
         self.last_image = None
         self.analyze_requested = False
         self.rag_service_url = kwargs.get('rag_service_url', 'http://localhost:8555')
+
+        # Frame change detection for better efficiency
+        self.last_processed_frame_hash = None
+        self.frame_similarity_threshold = 0.95
 
         # Video streams (like video_query.py)
         if JETSON_UTILS_AVAILABLE:
@@ -282,10 +286,14 @@ class VLMService(Agent):
         # Store last image for RAG analysis
         self.last_image = cudaMemcpy(image)
 
-        # Process frame for VLM analysis (every N frames)
+        # Process frame for VLM analysis (every N frames with change detection)
         self.frame_count += 1
         if self.frame_count % self.process_every_n_frames == 0:
-            self.process_video_frame(image)
+            # Check if frame has changed significantly before processing
+            if self._frame_has_changed(image):
+                self.process_video_frame(image)
+            else:
+                logger.debug("Frame unchanged, skipping VLM processing")
 
         # Draw overlays on the video
         self.draw_overlays(image)
@@ -299,12 +307,49 @@ class VLMService(Agent):
             np_image = cudaToNumpy(image)
             cudaDeviceSynchronize()
 
-            prompt = """Analyze this image for technical elements. List any detected objects, equipment, or issues. Be concise."""
+            prompt = """Look at this image and identify SPECIFIC objects you can see. List each object using exactly these categories:
+PEOPLE: person, man, woman, face, hand
+ELECTRONICS: phone, tablet, computer, monitor, display, screen
+CONTAINERS: mug, cup, bottle, glass, bowl
+TECHNICAL: connector, cable, wire, button, switch, panel, indicator, light, sensor, gauge, meter
+TOOLS: screwdriver, wrench, multimeter, probe
+HARDWARE: screw, bolt, nut, bracket, housing, cover
+SAFETY: warning, alarm, caution, emergency
+
+Format: "Objects: [object1], [object2], [object3]"
+Only list objects you can clearly see. Be specific and accurate."""
 
             self.llm(['/reset', np_image, prompt])
 
         except Exception as e:
             logger.error(f"Error processing video frame: {e}")
+
+    def _frame_has_changed(self, image) -> bool:
+        """Check if frame has changed significantly from last processed frame"""
+        try:
+            # Convert to numpy and create a simple hash
+            np_image = cudaToNumpy(image)
+            cudaDeviceSynchronize()
+
+            # Create simple hash of downsampled frame for comparison
+            small_frame = np_image[::8, ::8]  # Downsample by 8x for speed
+            frame_hash = hash(small_frame.tobytes())
+
+            if self.last_processed_frame_hash is None:
+                self.last_processed_frame_hash = frame_hash
+                return True
+
+            # Check if frame has changed
+            changed = frame_hash != self.last_processed_frame_hash
+            if changed:
+                self.last_processed_frame_hash = frame_hash
+                logger.info("Significant frame change detected, processing...")
+
+            return changed
+
+        except Exception as e:
+            logger.error(f"Error in frame change detection: {e}")
+            return True  # Process anyway if detection fails
 
     def draw_overlays(self, image):
         """Draw text overlays and object tags on video"""
@@ -515,18 +560,42 @@ class VLMService(Agent):
         content = raw_text.strip() if raw_text else ""
         confidence = 0.8 if content else 0.1
 
-        # Extract detected objects (simple keyword matching)
+        # Extract detected objects with improved parsing
         detected_objects = []
-        object_keywords = [
-            "phone", "mug", "cup", "wire","connector", "cable", "wire", "button", "switch", "panel", "display",
-            "warning", "light", "indicator", "gauge", "meter", "sensor",
-            "screw", "bolt", "nut", "cover", "housing", "bracket"
-        ]
 
-        content_lower = content.lower()
-        for keyword in object_keywords:
-            if keyword in content_lower:
-                detected_objects.append(keyword)
+        # Look for structured "Objects:" format first
+        if "objects:" in content.lower():
+            objects_line = ""
+            for line in content.split('\n'):
+                if "objects:" in line.lower():
+                    objects_line = line
+                    break
+
+            if objects_line:
+                # Extract objects from structured format
+                objects_part = objects_line.split(':', 1)[1].strip()
+                if objects_part and objects_part != "none" and objects_part != "[]":
+                    # Split by commas and clean up
+                    objects = [obj.strip().lower() for obj in objects_part.split(',')]
+                    objects = [obj.replace('[', '').replace(']', '') for obj in objects]
+                    detected_objects = [obj for obj in objects if obj and len(obj) > 1]
+
+        # Fallback to keyword matching if structured format not found
+        if not detected_objects:
+            object_keywords = [
+                "person", "man", "woman", "face", "hand",
+                "phone", "tablet", "computer", "monitor", "display", "screen",
+                "mug", "cup", "bottle", "glass", "bowl",
+                "connector", "cable", "wire", "button", "switch", "panel", "indicator", "light", "sensor", "gauge", "meter",
+                "screwdriver", "wrench", "multimeter", "probe",
+                "screw", "bolt", "nut", "bracket", "housing", "cover",
+                "warning", "alarm", "caution", "emergency"
+            ]
+
+            content_lower = content.lower()
+            for keyword in object_keywords:
+                if keyword in content_lower:
+                    detected_objects.append(keyword)
 
         # Extract suggested actions based on content
         suggested_actions = []
@@ -546,15 +615,29 @@ class VLMService(Agent):
         if not suggested_actions:
             suggested_actions = ["continue_monitoring"]
 
-        # Estimate confidence based on output length and clarity
-        if len(content) > 50 and any(obj in content_lower for obj in object_keywords):
-            confidence = 0.9
-        elif len(content) > 20:
+        # Estimate confidence based on detection quality
+        if "objects:" in content.lower() and detected_objects:
+            # Structured response with detected objects = high confidence
+            confidence = 0.95
+        elif detected_objects and len(detected_objects) >= 2:
+            # Multiple objects detected = good confidence
+            confidence = 0.85
+        elif detected_objects:
+            # Some objects detected = medium confidence
             confidence = 0.7
-        elif len(content) > 5:
-            confidence = 0.5
+        elif len(content) > 20:
+            # Response but no clear objects = low confidence
+            confidence = 0.4
         else:
+            # Very short or empty response = very low confidence
             confidence = 0.1
+
+        # Filter out low-confidence detections
+        if confidence < 0.6:
+            logger.warning(f"Low confidence detection ({confidence:.2f}): {content[:100]}...")
+
+        # Remove duplicates from detected objects
+        detected_objects = list(dict.fromkeys(detected_objects))  # Preserve order while removing duplicates
 
         return StructuredObservation(
             timestamp=datetime.now().isoformat(),
