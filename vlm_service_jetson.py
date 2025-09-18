@@ -166,7 +166,7 @@ class VLMService(Agent):
         self.latest_observation = None
         self.is_running = False
         self.frame_count = 0
-        self.process_every_n_frames = 30  # Process every 1 second at 30fps for testing
+        self.process_every_n_frames = 75  # Process every 2.5 seconds at 30fps (like video_query.py)
         self.latest_response = ""
 
         # Video processing state
@@ -251,7 +251,9 @@ class VLMService(Agent):
             # Process completed observation
             self.process_completed_observation()
 
-        logger.info(f"VLM Response: '{self.text.strip()}'")  # Show full response for debugging
+        # Only log when response is complete (at EOS)
+        if self.eos:
+            logger.info(f"VLM Complete Response: '{self.text.strip()}'")
 
     def process_completed_observation(self):
         """Process the completed VLM observation"""
@@ -307,16 +309,11 @@ class VLMService(Agent):
             np_image = cudaToNumpy(image)
             cudaDeviceSynchronize()
 
-            prompt = """Look at this image. Can you see any of these 4 objects?
-1. Red Hat 
-2. phone (mobile phone or smartphone)
-3. mug (coffee mug or cup)
-4. Screwdriver
+            prompt = """What objects can you see in this image? Choose from: red hat, phone, mug, screwdriver.
 
-Answer ONLY with this format: "Objects: [objects you see]"
-Examples: "Objects: Red Hat, phone" or "Objects: mug" or "Objects: none"
+Answer format: Objects: [what you see]
 
-Be accurate - only list what you clearly see."""
+If you see nothing from the list, answer: Objects: none"""
 
             self.llm(['/reset', np_image, prompt])
 
@@ -553,8 +550,11 @@ Be accurate - only list what you clearly see."""
         # Extract detected objects with improved parsing
         detected_objects = []
 
-        # Look for structured "Objects:" format first
-        if "objects:" in content.lower():
+        # Filter out responses that just echo the prompt
+        if any(phrase in content.lower() for phrase in ["1. red hat", "2. phone", "3. mug", "4. screwdriver"]):
+            logger.warning("Model echoed prompt instead of analyzing image - ignoring response")
+            detected_objects = []
+        elif "objects:" in content.lower():
             objects_line = ""
             for line in content.split('\n'):
                 if "objects:" in line.lower():
@@ -573,7 +573,7 @@ Be accurate - only list what you clearly see."""
         # Fallback to keyword matching if structured format not found
         if not detected_objects:
             # Test with only 4 simple objects
-            object_keywords = ["person", "phone", "mug", "screwdriver"]
+            object_keywords = ["red hat", "phone", "mug", "screwdriver"]
 
             content_lower = content.lower()
             for keyword in object_keywords:
