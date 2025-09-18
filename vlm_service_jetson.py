@@ -166,7 +166,7 @@ class VLMService(Agent):
         self.latest_observation = None
         self.is_running = False
         self.frame_count = 0
-        self.process_every_n_frames = 60  # Process every 2 seconds at 30fps (more responsive)
+        self.process_every_n_frames = 30  # Process every 1 second at 30fps for testing
         self.latest_response = ""
 
         # Video processing state
@@ -251,7 +251,7 @@ class VLMService(Agent):
             # Process completed observation
             self.process_completed_observation()
 
-        logger.debug(f"Text update: {text} | Current: {self.text[:100]}...")
+        logger.info(f"VLM Response: '{self.text.strip()}'")  # Show full response for debugging
 
     def process_completed_observation(self):
         """Process the completed VLM observation"""
@@ -307,17 +307,16 @@ class VLMService(Agent):
             np_image = cudaToNumpy(image)
             cudaDeviceSynchronize()
 
-            prompt = """Look at this image and identify SPECIFIC objects you can see. List each object using exactly these categories:
-PEOPLE: person, man, woman, face, hand
-ELECTRONICS: phone, tablet, computer, monitor, display, screen
-CONTAINERS: mug, cup, bottle, glass, bowl
-TECHNICAL: connector, cable, wire, button, switch, panel, indicator, light, sensor, gauge, meter
-TOOLS: screwdriver, wrench, multimeter, probe
-HARDWARE: screw, bolt, nut, bracket, housing, cover
-SAFETY: warning, alarm, caution, emergency
+            prompt = """Look at this image. Can you see any of these 4 objects?
+1. Red Hat 
+2. phone (mobile phone or smartphone)
+3. mug (coffee mug or cup)
+4. Screwdriver
 
-Format: "Objects: [object1], [object2], [object3]"
-Only list objects you can clearly see. Be specific and accurate."""
+Answer ONLY with this format: "Objects: [objects you see]"
+Examples: "Objects: Red Hat, phone" or "Objects: mug" or "Objects: none"
+
+Be accurate - only list what you clearly see."""
 
             self.llm(['/reset', np_image, prompt])
 
@@ -358,25 +357,16 @@ Only list objects you can clearly see. Be specific and accurate."""
 
         y = 5
 
-        # Draw latest VLM analysis
-        if self.text:
-            clean_text = self.text.replace('\n', '').replace('</s>', '').strip()
-            y = wrap_text(self.font, image, text=f"Analysis: {clean_text}",
-                         x=5, y=y, color=self.font.White, background=self.font.Gray40)
-
-        # Draw detected objects with tags
+        # Draw only detected objects (simplified)
         if self.latest_observation and self.latest_observation.detected_objects:
-            objects_text = "Objects: " + ", ".join(self.latest_observation.detected_objects)
-            y = wrap_text(self.font, image, text=objects_text,
+            objects_text = "Detected: " + ", ".join(self.latest_observation.detected_objects[:3])  # Max 3 objects
+            confidence_text = f" ({self.latest_observation.confidence:.1f})"
+            y = wrap_text(self.font, image, text=objects_text + confidence_text,
                          x=5, y=y, color=(120,215,21), background=self.font.Gray40)
 
-        # Draw analyze button prompt
-        y = wrap_text(self.font, image, text="Press 'A' for RAG Analysis",
+        # Draw simple instruction
+        y = wrap_text(self.font, image, text="Press 'A' to analyze",
                      x=5, y=y, color=(255,172,28), background=self.font.Gray40)
-
-        # Draw frame counter
-        y = wrap_text(self.font, image, text=f"Frame: {self.frame_count}",
-                     x=5, y=y, color=(128,128,128), background=self.font.Gray40)
 
     def setup_keyboard_handler(self):
         """Setup keyboard handler for analyze button"""
@@ -582,15 +572,8 @@ Only list objects you can clearly see. Be specific and accurate."""
 
         # Fallback to keyword matching if structured format not found
         if not detected_objects:
-            object_keywords = [
-                "person", "man", "woman", "face", "hand",
-                "phone", "tablet", "computer", "monitor", "display", "screen",
-                "mug", "cup", "bottle", "glass", "bowl",
-                "connector", "cable", "wire", "button", "switch", "panel", "indicator", "light", "sensor", "gauge", "meter",
-                "screwdriver", "wrench", "multimeter", "probe",
-                "screw", "bolt", "nut", "bracket", "housing", "cover",
-                "warning", "alarm", "caution", "emergency"
-            ]
+            # Test with only 4 simple objects
+            object_keywords = ["person", "phone", "mug", "screwdriver"]
 
             content_lower = content.lower()
             for keyword in object_keywords:
