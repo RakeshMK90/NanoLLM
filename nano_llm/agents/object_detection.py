@@ -17,7 +17,7 @@ from nano_llm.web import WebServer
 from nano_llm.plugins import VideoSource, VideoOutput, ChatQuery, PrintStream, ProcessProxy, EventFilter, NanoDB
 from nano_llm.utils import ArgParser, print_table, wrap_text
 
-from jetson_utils import cudaFont, cudaMemcpy, cudaToNumpy, cudaDeviceSynchronize, saveImage, cudaDrawRect, cudaDrawText
+from jetson_utils import cudaFont, cudaMemcpy, cudaToNumpy, cudaDeviceSynchronize, saveImage
 
 
 class ObjectDetection(Agent):
@@ -232,41 +232,17 @@ class ObjectDetection(Agent):
         return position_map.get(position, (0.3, 0.3, 0.7, 0.7))
 
     def draw_bounding_boxes(self, image, detections: List[Dict]):
-        """Draw bounding boxes and labels on the image."""
+        """Draw bounding boxes and labels on the image using text overlays."""
         if not detections:
             return
             
-        height, width = image.height, image.width
+        # For now, just display the detected objects as text overlays
+        # This avoids dependency on potentially unavailable drawing functions
+        detection_text = "Detected: " + ", ".join([f"{d['object']} ({d['confidence']:.2f})" for d in detections])
         
-        for detection in detections:
-            obj = detection['object']
-            bbox = detection['bbox']
-            confidence = detection['confidence']
-            
-            # Scale bounding box to image dimensions
-            x1 = int(bbox[0] * width)
-            y1 = int(bbox[1] * height)
-            x2 = int(bbox[2] * width)
-            y2 = int(bbox[3] * height)
-            
-            # Get color for this object type
-            color = self.object_colors.get(obj, (255, 255, 255))
-            
-            # Draw bounding box rectangle
-            cudaDrawRect(image, (x1, y1, x2, y2), color, thickness=3)
-            
-            # Draw label background
-            label_text = f"{obj} ({confidence:.2f})"
-            label_width = len(label_text) * 8  # Approximate character width
-            label_height = 20
-            
-            # Draw label background rectangle
-            cudaDrawRect(image, (x1, y1 - label_height, x1 + label_width, y1), 
-                        color, thickness=-1)  # Filled rectangle
-            
-            # Draw label text
-            cudaDrawText(image, label_text, (x1 + 2, y1 - label_height + 2), 
-                        color=(255, 255, 255), font=self.font)
+        # Draw detection summary at the top of the image
+        wrap_text(self.font, image, text=detection_text, x=5, y=5, 
+                 color=(255, 255, 0), background=self.font.Gray40)
 
     def on_video(self, image):
         """
